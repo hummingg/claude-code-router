@@ -192,6 +192,9 @@ async function run(options: RunOptions = {}) {
         config,
         event
       });
+
+      // 保存完整的模型信息(包含 provider),因为后续可能会被修改
+      req.fullModelInfo = req.body?.model;
     }
   });
   server.addHook("onError", async (request, reply, error) => {
@@ -200,6 +203,9 @@ async function run(options: RunOptions = {}) {
   server.addHook("onSend", (req, reply, payload, done) => {
     if (req.sessionId && req.url.startsWith("/v1/messages") && !req.url.startsWith("/v1/messages/count_tokens")) {
       if (payload instanceof ReadableStream) {
+        // 使用之前保存的完整模型信息(包含 provider)
+        const currentModel = req.fullModelInfo || req.body?.model || 'unknown';
+
         if (req.agents) {
           const abortController = new AbortController();
           const eventStream = payload.pipeThrough(new SSEParserTransform())
@@ -210,8 +216,21 @@ async function run(options: RunOptions = {}) {
           let currentToolId = ''
           const toolMessages: any[] = []
           const assistantMessages: any[] = []
+          let modelInfoSent = false;
           // 存储Anthropic格式的消息体，区分文本和工具类型
           return done(null, rewriteStream(eventStream, async (data, controller) => {
+            // 在第一个事件前插入模型信息
+            if (!modelInfoSent) {
+              modelInfoSent = true;
+              controller.enqueue({
+                event: 'model_info',
+                data: {
+                  type: 'model_info',
+                  model: currentModel
+                }
+              });
+            }
+
             try {
               // 检测工具调用开始
               if (data.event === 'content_block_start' && data?.data?.content_block?.name) {
@@ -327,6 +346,69 @@ async function run(options: RunOptions = {}) {
         }
 
         const [originalStream, clonedStream] = payload.tee();
+
+        // 创建一个新的流来注入模型信息到第一个文本块
+        const streamWithModelInfo = new ReadableStream({
+          async start(controller) {
+            const reader = originalStream.getReader();
+            let firstTextSent = false;
+
+            // 解析 provider 和 model,并格式化显示
+            let displayText = '';
+            const routerName = req.routerName || 'default';
+            if (currentModel.includes(',')) {
+              const [provider, model] = currentModel.split(',');
+              displayText = `🤖 *[Provider: ${provider} | Model: ${model} | Router: ${routerName}]*\n\n`;
+            } else {
+              displayText = `🤖 *[Model: ${currentModel} | Router: ${routerName}]*\n\n`;
+            }
+
+            try {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                // 解析 SSE 数据以检测第一个文本块
+                const dataStr = new TextDecoder().decode(value);
+
+                // 在第一个 content_block_delta 文本事件中注入模型信息
+                if (!firstTextSent && dataStr.includes('content_block_delta') && dataStr.includes('text_delta')) {
+                  firstTextSent = true;
+
+                  // 解析并修改第一个文本块
+                  const lines = dataStr.split('\n');
+                  let modified = false;
+
+                  for (let i = 0; i < lines.length; i++) {
+                    if (lines[i].startsWith('data: ') && !modified) {
+                      try {
+                        const data = JSON.parse(lines[i].substring(6));
+                        if (data.type === 'content_block_delta' && data.delta?.type === 'text_delta') {
+                          // 在第一个文本前添加模型信息
+                          data.delta.text = displayText + data.delta.text;
+                          lines[i] = 'data: ' + JSON.stringify(data);
+                          modified = true;
+                        }
+                      } catch (e) {
+                        // 解析失败,跳过
+                      }
+                    }
+                  }
+
+                  controller.enqueue(new TextEncoder().encode(lines.join('\n')));
+                } else {
+                  controller.enqueue(value);
+                }
+              }
+              controller.close();
+            } catch (error) {
+              controller.error(error);
+            } finally {
+              reader.releaseLock();
+            }
+          }
+        });
+
         const read = async (stream: ReadableStream) => {
           const reader = stream.getReader();
           try {
@@ -355,7 +437,7 @@ async function run(options: RunOptions = {}) {
           }
         }
         read(clonedStream);
-        return done(null, originalStream)
+        return done(null, streamWithModelInfo)
       }
       sessionUsageCache.put(req.sessionId, payload.usage);
       if (typeof payload ==='object') {

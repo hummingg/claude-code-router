@@ -116,7 +116,7 @@ const getUseModel = async (
   }
   // If the model is claude-3-5-haiku, use the background model
   if (
-    req.body.model?.startsWith("claude-3-5-haiku") &&
+    req.body.model?.includes("-haiku") &&
     config.Router.background
   ) {
     req.log.info(`Using background model for ${req.body.model}`);
@@ -161,6 +161,7 @@ export const router = async (req: any, _res: any, context: any) => {
     );
 
     let model;
+    let routerName = 'default';
     if (config.CUSTOM_ROUTER_PATH) {
       try {
         const customRouter = require(config.CUSTOM_ROUTER_PATH);
@@ -168,17 +169,35 @@ export const router = async (req: any, _res: any, context: any) => {
         model = await customRouter(req, config, {
           event
         });
+        routerName = 'custom';
       } catch (e: any) {
         req.log.error(`failed to load custom router: ${e.message}`);
       }
     }
     if (!model) {
       model = await getUseModel(req, tokenCount, config, lastMessageUsage);
+      // Determine which router was used
+      if (req.body.model?.includes("-haiku") && config.Router.background && model === config.Router.background) {
+        routerName = 'background';
+      } else if (req.body.thinking && config.Router.think && model === config.Router.think) {
+        routerName = 'think';
+      } else if ((lastMessageUsage?.input_tokens > (config.Router.longContextThreshold || 60000) && tokenCount > 20000) ||
+                 tokenCount > (config.Router.longContextThreshold || 60000)) {
+        routerName = 'longContext';
+      } else if (Array.isArray(req.body.tools) &&
+                 req.body.tools.some((tool: any) => tool.type?.startsWith("web_search")) &&
+                 config.Router.webSearch && model === config.Router.webSearch) {
+        routerName = 'webSearch';
+      } else if (config.Router.image && model === config.Router.image) {
+        routerName = 'image';
+      }
     }
     req.body.model = model;
+    req.routerName = routerName;
   } catch (error: any) {
     req.log.error(`Error in router middleware: ${error.message}`);
     req.body.model = config.Router!.default;
+    req.routerName = 'default';
   }
   return;
 };
